@@ -1,6 +1,9 @@
 name: build
 on: [push, pull_request, workflow_dispatch]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -25,3 +28,12 @@ jobs:
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
+      - name: publish to the "latest" release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          JAR=$(ls build/libs/*.jar | grep -v sources | head -n1)
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest "$JAR" --prerelease --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Built automatically from commit ${GITHUB_SHA}. Download the .jar below and put it in your mods folder (needs Fabric API)."
