@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"id": "realsky",
+	"version": "${version}",
+	"name": "Realistic Sky",
+	"description": "Replaces the overworld sky with a physically based atmosphere, volumetric clouds, a real star catalog, the Milky Way and nebulae.",
+	"authors": ["abeghjdk123-beep"],
+	"contact": {
+		"sources": "https://github.com/abeghjdk123-beep/realistic-sky"
+	},
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.realsky.RealSky"]
+	},
+	"mixins": [
+		"realsky.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.17.0",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

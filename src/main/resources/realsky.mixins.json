@@ -1,0 +1,12 @@
+{
+	"required": true,
+	"package": "com.realsky.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"WorldRendererMixin",
+		"FogRendererMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
