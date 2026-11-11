@@ -12,7 +12,6 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.text.Text;
 import net.minecraft.world.World;
-import net.minecraft.world.attribute.EnvironmentAttributes;
 import org.joml.Matrix3f;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
@@ -46,9 +45,13 @@ public class SkyRenderer {
     private final Matrix4f invViewProj = new Matrix4f();
     private final Matrix3f worldToEq = new Matrix3f();
 
-    private int skyProgram, starProgram, alphaProgram;
+    private static final int LUT_W = 256, LUT_H = 128;
+
+    private int lutProgram, cloudProgram, compositeProgram, starProgram, alphaProgram;
     private int emptyVao, starVao, starVbo, starCount;
     private int milkyWayTex, noiseTex;
+    private int lutTex, lutFbo;
+    private int cloudTex, cloudFbo, cloudW, cloudH;
     private final Map<Integer, Map<String, Integer>> uniformCache = new HashMap<>();
 
     private boolean initialized;
@@ -86,10 +89,9 @@ public class SkyRenderer {
         if (RealSky.irisShadersActive()) return;
 
         try {
-            float sunAngle = camera.getEnvironmentAttributeInterpolator().get(EnvironmentAttributes.SUN_ANGLE_VISUAL, tickDelta);
             double gameSeconds = (world.getTime() + tickDelta) / 20.0;
             var pos = camera.getCameraPos();
-            state.update(cfg, sunAngle, world.getTimeOfDay(), pos.x, pos.y, pos.z, camera.getYaw(),
+            state.update(cfg, world.getTimeOfDay(), tickDelta, pos.x, pos.y, pos.z, camera.getYaw(),
                 world.getRainGradient(tickDelta), world.getThunderGradient(tickDelta), gameSeconds);
         } catch (Throwable t) {
             fail("Failed to compute sky state", t);
@@ -151,67 +153,114 @@ public class SkyRenderer {
         MinecraftClient mc = MinecraftClient.getInstance();
         Framebuffer fb = mc.getFramebuffer();
         RealSkyConfig cfg = RealSky.config;
+        int width = fb.textureWidth, height = fb.textureHeight;
+        boolean cloudsOn = cfg.clouds && noiseTex != 0;
 
         try (RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(
             () -> "Realistic Sky", fb.getColorAttachmentView(), OptionalInt.empty(), fb.getDepthAttachmentView(), OptionalDouble.empty())) {
 
+            int prevDrawFbo = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
+            int prevReadFbo = glGetInteger(GL_READ_FRAMEBUFFER_BINDING);
             int prevProgram = glGetInteger(GL_CURRENT_PROGRAM);
             int prevVao = glGetInteger(GL_VERTEX_ARRAY_BINDING);
             boolean[] prevMask = colorMask();
-            GlStateManager._activeTexture(GL_TEXTURE0);
-            int prevSampler0 = glGetInteger(GL_SAMPLER_BINDING);
-            GlStateManager._activeTexture(GL_TEXTURE1);
-            int prevSampler1 = glGetInteger(GL_SAMPLER_BINDING);
+            int[] prevSamplers = new int[4];
+            for (int u = 0; u < 4; u++) {
+                GlStateManager._activeTexture(GL_TEXTURE0 + u);
+                prevSamplers[u] = glGetInteger(GL_SAMPLER_BINDING);
+                glBindSampler(u, 0);
+            }
 
-            GlStateManager._viewport(0, 0, fb.textureWidth, fb.textureHeight);
             GlStateManager._disableDepthTest();
             GlStateManager._depthMask(false);
             GlStateManager._disableCull();
             GlStateManager._disableBlend();
             glColorMask(true, true, true, true);
-
-            // Textures: unit 0 = Milky Way map, unit 1 = 3D cloud noise.
-            GlStateManager._activeTexture(GL_TEXTURE1);
-            glBindSampler(1, 0);
-            glBindTexture(GL_TEXTURE_3D, noiseTex);
-            GlStateManager._activeTexture(GL_TEXTURE0);
-            glBindSampler(0, 0);
-            GlStateManager._bindTexture(milkyWayTex);
-
-            // 1) Sky, sun, moon, Milky Way, clouds. Alpha = how visible stars are at each pixel.
-            glUseProgram(skyProgram);
-            setMat4(skyProgram, "uInvViewProj", invViewProj);
-            setMat3(skyProgram, "uWorldToEq", worldToEq);
-            setVec3(skyProgram, "uSunDir", state.sunDir);
-            setVec3(skyProgram, "uMoonDir", state.moonDir);
-            setVec3(skyProgram, "uMoonLightDir", state.moonLightDir);
-            setVec3(skyProgram, "uPoleDir", state.poleDir);
-            setVec3(skyProgram, "uSunColor", state.sunColor);
-            setVec3(skyProgram, "uMoonColor", state.moonColor);
-            setVec3(skyProgram, "uAmbient", state.ambient);
-            setVec3(skyProgram, "uCloudOffset", state.cloudOffset);
-            setFloat(skyProgram, "uSunI", SkyState.SUN_I);
-            setFloat(skyProgram, "uMoonI", state.moonI);
-            setFloat(skyProgram, "uExposure", state.exposure);
-            setFloat(skyProgram, "uNightScale", 1f / SkyState.NIGHT_EXPOSURE);
-            setFloat(skyProgram, "uCamAlt", state.camAltKm + 0.064f);
-            setFloat(skyProgram, "uRain", state.rain);
-            setFloat(skyProgram, "uCoverage", cfg.cloudCoverage);
-            setFloat(skyProgram, "uSunRadius", (float) Math.toRadians(cfg.sunRadiusDeg));
-            setFloat(skyProgram, "uMoonRadius", (float) Math.toRadians(cfg.moonRadiusDeg));
-            setFloat(skyProgram, "uMilkyWay", cfg.milkyWayBrightness);
-            setFloat(skyProgram, "uNebula", cfg.nebulaStrength);
-            setFloat(skyProgram, "uTime", state.timeSeconds);
-            setInt(skyProgram, "uSteps", cfg.cloudQuality);
-            setInt(skyProgram, "uCloudsOn", cfg.clouds && noiseTex != 0 ? 1 : 0);
-            setInt(skyProgram, "uReflect", cfg.reflectiveHorizon ? 1 : 0);
-            setInt(skyProgram, "uMilkyWayTex", 0);
-            setInt(skyProgram, "uNoise", 1);
             glBindVertexArray(emptyVao);
+
+            // Units: 0 = Milky Way, 1 = cloud noise (3D), 2 = sky table, 3 = clouds.
+            GlStateManager._activeTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_3D, noiseTex);
+
+            // 1) Atmosphere into the small sky-view table.
+            GlStateManager._glBindFramebuffer(GL_FRAMEBUFFER, lutFbo);
+            GlStateManager._viewport(0, 0, LUT_W, LUT_H);
+            glUseProgram(lutProgram);
+            setVec3(lutProgram, "uSunDir", state.sunDir);
+            setVec3(lutProgram, "uMoonDir", state.moonDir);
+            setFloat(lutProgram, "uSunI", SkyState.SUN_I);
+            setFloat(lutProgram, "uMoonI", state.moonI);
+            setFloat(lutProgram, "uCamAlt", state.camAltKm + 0.064f);
+            setFloat(lutProgram, "uNightScale", 1f / SkyState.NIGHT_EXPOSURE);
             glDrawArrays(GL_TRIANGLES, 0, 3);
 
-            // 2) Stars, added on top and weighted by the alpha written above.
-            if (starCount > 0 && cfg.starBrightness > 0) {
+            GlStateManager._activeTexture(GL_TEXTURE2);
+            GlStateManager._bindTexture(lutTex);
+
+            // 2) Volumetric clouds at reduced resolution.
+            if (cloudsOn) {
+                ensureCloudTarget(Math.max(1, Math.round(width * cfg.cloudResolution)), Math.max(1, Math.round(height * cfg.cloudResolution)));
+                GlStateManager._glBindFramebuffer(GL_FRAMEBUFFER, cloudFbo);
+                GlStateManager._viewport(0, 0, cloudW, cloudH);
+                glUseProgram(cloudProgram);
+                setMat4(cloudProgram, "uInvViewProj", invViewProj);
+                setInt(cloudProgram, "uSkyLut", 2);
+                setInt(cloudProgram, "uNoise", 1);
+                setVec3(cloudProgram, "uSunDir", state.sunDir);
+                setVec3(cloudProgram, "uMoonDir", state.moonDir);
+                setVec3(cloudProgram, "uSunColor", state.sunColor);
+                setVec3(cloudProgram, "uMoonColor", state.moonColor);
+                setVec3(cloudProgram, "uAmbient", state.ambient);
+                setVec3(cloudProgram, "uCloudOffset", state.cloudOffset);
+                setFloat(cloudProgram, "uCoverage", cfg.cloudCoverage);
+                setFloat(cloudProgram, "uRain", state.rain);
+                setFloat(cloudProgram, "uCamAlt", state.camAltKm + 0.064f);
+                setInt(cloudProgram, "uSteps", cfg.cloudQuality);
+                setInt(cloudProgram, "uReflect", cfg.reflectiveHorizon ? 1 : 0);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                GlStateManager._activeTexture(GL_TEXTURE3);
+                GlStateManager._bindTexture(cloudTex);
+            }
+
+            // 3) Final sky into Minecraft's framebuffer.
+            GlStateManager._glBindFramebuffer(GL_FRAMEBUFFER, prevDrawFbo);
+            GlStateManager._viewport(0, 0, width, height);
+            GlStateManager._activeTexture(GL_TEXTURE0);
+            GlStateManager._bindTexture(milkyWayTex);
+            int p = compositeProgram;
+            glUseProgram(p);
+            setMat4(p, "uInvViewProj", invViewProj);
+            setMat3(p, "uWorldToEq", worldToEq);
+            setVec3(p, "uSunDir", state.sunDir);
+            setVec3(p, "uMoonDir", state.moonDir);
+            setVec3(p, "uMoonLightDir", state.moonLightDir);
+            setVec3(p, "uPoleDir", state.poleDir);
+            setVec3(p, "uSunTrans", state.sunTrans);
+            setVec3(p, "uMoonTrans", state.moonTrans);
+            setVec3(p, "uSunColor", state.sunColor);
+            setVec3(p, "uAmbient", state.ambient);
+            setVec3(p, "uCloudOffset", state.cloudOffset);
+            setFloat(p, "uRain", state.rain);
+            setFloat(p, "uCoverage", cfg.cloudCoverage);
+            setFloat(p, "uSunI", SkyState.SUN_I);
+            setFloat(p, "uExposure", state.exposure);
+            setFloat(p, "uNightScale", 1f / SkyState.NIGHT_EXPOSURE);
+            setFloat(p, "uSunRadius", (float) Math.toRadians(cfg.sunRadiusDeg));
+            setFloat(p, "uMoonRadius", (float) Math.toRadians(cfg.moonRadiusDeg));
+            setFloat(p, "uMilkyWay", cfg.milkyWayBrightness);
+            setFloat(p, "uNebula", cfg.nebulaStrength);
+            setFloat(p, "uCirrus", noiseTex != 0 ? cfg.cirrus : 0f);
+            setVec2(p, "uCloudTexel", 1f / Math.max(1, cloudW), 1f / Math.max(1, cloudH));
+            setInt(p, "uCloudsOn", cloudsOn ? 1 : 0);
+            setInt(p, "uReflect", cfg.reflectiveHorizon ? 1 : 0);
+            setInt(p, "uMilkyWayTex", 0);
+            setInt(p, "uNoise", 1);
+            setInt(p, "uSkyLut", 2);
+            setInt(p, "uClouds", 3);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // 4) Stars, added on top and weighted by the alpha written above.
+            if (starCount > 0 && cfg.starBrightness > 0 && state.exposure / SkyState.NIGHT_EXPOSURE > 0.002f) {
                 GlStateManager._enableBlend();
                 GlStateManager._blendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
                 glEnable(GL_PROGRAM_POINT_SIZE);
@@ -221,33 +270,75 @@ public class SkyRenderer {
                 setFloat(starProgram, "uExposure", state.exposure);
                 setFloat(starProgram, "uStarScale", 20f / SkyState.NIGHT_EXPOSURE * cfg.starBrightness);
                 setFloat(starProgram, "uTime", state.timeSeconds);
-                setFloat(starProgram, "uPixelScale", Math.max(0.5f, fb.textureHeight / 1080f));
+                setFloat(starProgram, "uPixelScale", Math.max(0.5f, height / 1080f));
                 glBindVertexArray(starVao);
                 glDrawArrays(GL_POINTS, 0, starCount);
+                glBindVertexArray(emptyVao);
                 glDisable(GL_PROGRAM_POINT_SIZE);
                 GlStateManager._disableBlend();
             }
 
-            // 3) Put alpha back to 1 so later passes see an opaque sky.
+            // 5) Put alpha back to 1 so later passes see an opaque sky.
             glColorMask(false, false, false, true);
             glUseProgram(alphaProgram);
-            glBindVertexArray(emptyVao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
 
             // Restore state.
             glColorMask(prevMask[0], prevMask[1], prevMask[2], prevMask[3]);
+            GlStateManager._activeTexture(GL_TEXTURE3);
+            GlStateManager._bindTexture(0);
+            GlStateManager._activeTexture(GL_TEXTURE2);
+            GlStateManager._bindTexture(0);
             GlStateManager._activeTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_3D, 0);
-            glBindSampler(1, prevSampler1);
             GlStateManager._activeTexture(GL_TEXTURE0);
             GlStateManager._bindTexture(0);
-            glBindSampler(0, prevSampler0);
+            for (int u = 0; u < 4; u++) glBindSampler(u, prevSamplers[u]);
+            GlStateManager._glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFbo);
+            GlStateManager._glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
             glBindVertexArray(prevVao);
             glUseProgram(prevProgram);
             GlStateManager._depthMask(true);
             GlStateManager._enableDepthTest();
             GlStateManager._enableCull();
         }
+    }
+
+    private void ensureCloudTarget(int w, int h) {
+        if (cloudTex != 0 && w == cloudW && h == cloudH) return;
+        if (cloudFbo != 0) glDeleteFramebuffers(cloudFbo);
+        if (cloudTex != 0) GlStateManager._deleteTexture(cloudTex);
+        cloudTex = createTarget(w, h, GL_CLAMP_TO_EDGE);
+        cloudFbo = createFbo(cloudTex);
+        cloudW = w;
+        cloudH = h;
+    }
+
+    private static int createTarget(int w, int h, int wrapS) {
+        int tex = glGenTextures();
+        GlStateManager._activeTexture(GL_TEXTURE0);
+        GlStateManager._bindTexture(tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, (ByteBuffer) null);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        GlStateManager._bindTexture(0);
+        return tex;
+    }
+
+    private static int createFbo(int tex) {
+        int prevDraw = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
+        int prevRead = glGetInteger(GL_READ_FRAMEBUFFER_BINDING);
+        int fbo = glGenFramebuffers();
+        GlStateManager._glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        int status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        GlStateManager._glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDraw);
+        GlStateManager._glBindFramebuffer(GL_READ_FRAMEBUFFER, prevRead);
+        if (status != GL_FRAMEBUFFER_COMPLETE) throw new IllegalStateException("Sky framebuffer incomplete: 0x" + Integer.toHexString(status));
+        return fbo;
     }
 
     private static boolean[] colorMask() {
@@ -261,7 +352,9 @@ public class SkyRenderer {
     // ------------------------------------------------------------------ resources
 
     private void init() throws IOException {
-        skyProgram = link("fullscreen.vsh", "sky.fsh");
+        lutProgram = link("fullscreen.vsh", "skylut.fsh");
+        cloudProgram = link("fullscreen.vsh", "clouds.fsh");
+        compositeProgram = link("fullscreen.vsh", "composite.fsh");
         starProgram = link("stars.vsh", "stars.fsh");
         alphaProgram = link("fullscreen.vsh", "alpha.fsh");
 
@@ -273,13 +366,20 @@ public class SkyRenderer {
         glBindBuffer(GL_ARRAY_BUFFER, prevBuf);
 
         loadMilkyWay();
+        lutTex = createTarget(LUT_W, LUT_H, GL_REPEAT);
+        lutFbo = createFbo(lutTex);
         initialized = true;
         RealSky.LOGGER.info("Realistic Sky GL resources ready ({} stars)", starCount);
     }
 
     private void destroy() {
-        for (int p : new int[]{skyProgram, starProgram, alphaProgram}) if (p != 0) glDeleteProgram(p);
-        skyProgram = starProgram = alphaProgram = 0;
+        for (int p : new int[]{lutProgram, cloudProgram, compositeProgram, starProgram, alphaProgram}) if (p != 0) glDeleteProgram(p);
+        lutProgram = cloudProgram = compositeProgram = starProgram = alphaProgram = 0;
+        if (lutFbo != 0) glDeleteFramebuffers(lutFbo);
+        if (cloudFbo != 0) glDeleteFramebuffers(cloudFbo);
+        if (lutTex != 0) GlStateManager._deleteTexture(lutTex);
+        if (cloudTex != 0) GlStateManager._deleteTexture(cloudTex);
+        lutFbo = cloudFbo = lutTex = cloudTex = cloudW = cloudH = 0;
         uniformCache.clear();
         if (emptyVao != 0) glDeleteVertexArrays(emptyVao);
         if (starVao != 0) glDeleteVertexArrays(starVao);
@@ -417,6 +517,12 @@ public class SkyRenderer {
     }
 
     private static String shaderSource(String name) throws IOException {
+        String src = rawSource(name);
+        if (src.contains("#include \"common.glsl\"")) src = src.replace("#include \"common.glsl\"", rawSource("common.glsl"));
+        return src;
+    }
+
+    private static String rawSource(String name) throws IOException {
         Path override = FabricLoader.getInstance().getConfigDir().resolve("realsky").resolve("shaders").resolve(name);
         if (Files.isRegularFile(override)) return Files.readString(override, StandardCharsets.UTF_8);
         try (InputStream in = open("shaders/" + name)) {
@@ -466,6 +572,11 @@ public class SkyRenderer {
     private void setInt(int p, String n, int v) {
         int l = loc(p, n);
         if (l >= 0) glUniform1i(l, v);
+    }
+
+    private void setVec2(int p, String n, float x, float y) {
+        int l = loc(p, n);
+        if (l >= 0) glUniform2f(l, x, y);
     }
 
     private void setVec3(int p, String n, float[] v) {

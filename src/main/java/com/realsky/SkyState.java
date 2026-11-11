@@ -18,6 +18,8 @@ public class SkyState {
     public final float[] poleDir = new float[3];
     public final float[] sunColor = new float[3];
     public final float[] moonColor = new float[3];
+    public final float[] sunTrans = new float[3];
+    public final float[] moonTrans = new float[3];
     public final float[] ambient = new float[3];
     public final float[] fogColor = new float[3];
     public final float[] cloudOffset = new float[3];
@@ -34,14 +36,23 @@ public class SkyState {
     private boolean exposureInit;
 
     /**
-     * @param sunAngleDeg vanilla sun angle in degrees, 0 = noon
-     * @param timeOfDay   world time of day in ticks (for moon phase and star drift)
+     * Vanilla's celestial angle as a fraction of a full turn, 0 = noon (same curve the game uses for the sun).
      */
-    public void update(RealSkyConfig cfg, float sunAngleDeg, long timeOfDay, double camX, double camY, double camZ,
+    public static double celestialAngle(long timeOfDay, float tickDelta) {
+        double t = (Math.floorMod(timeOfDay, 24000L) + tickDelta) / 24000.0;
+        double d = t - 0.25;
+        d -= Math.floor(d);
+        return (d * 2.0 + (0.5 - Math.cos(d * Math.PI) / 2.0)) / 3.0;
+    }
+
+    /**
+     * @param timeOfDay world time of day in ticks (drives sun, moon, phase and star rotation)
+     */
+    public void update(RealSkyConfig cfg, long timeOfDay, float tickDelta, double camX, double camY, double camZ,
                        float yawDeg, float rainGradient, float thunderGradient, double gameSeconds) {
         double phi = Math.toRadians(cfg.latitude);
-        double a = Math.toRadians(sunAngleDeg);
-        double day = timeOfDay / 24000.0;
+        double a = celestialAngle(timeOfDay, tickDelta) * 2.0 * Math.PI;
+        double day = (timeOfDay + (double) tickDelta) / 24000.0;
         double dec = 0;
         if (cfg.seasons) dec = Math.toRadians(23.44) * Math.sin(2 * Math.PI * day / Math.max(1f, cfg.seasonLengthDays));
 
@@ -59,6 +70,7 @@ public class SkyState {
         Lm.mul(Rz, eqToWorld);
 
         int phase = (int) Math.floorMod(Math.floorDiv(timeOfDay, 24000L), 8L);
+        // Star field turns with the sun (sidereal drift added above via the day count).
         double psi = Math.toRadians(phase * 45.0);
         float[] tang = cross(poleDir, moonDir);
         normalize(tang);
@@ -69,7 +81,7 @@ public class SkyState {
         rain = Math.max(rainGradient, thunderGradient);
         camAltKm = (float) Math.max(0.0, (camY - 63.0) * 0.001);
 
-        float[] ro = {0, Atmosphere.RG + camAltKm, 0};
+        float[] ro = {0, Atmosphere.RG + camAltKm + 0.064f, 0};
         float[] zen = sky(ro, new float[]{0, 1, 0});
         float[] hor = new float[3];
         for (int az = 0; az < 360; az += 90) {
@@ -83,9 +95,14 @@ public class SkyState {
         float[] cloudPt = {0, Atmosphere.RG + 2.0f, 0};
         float[] st = Atmosphere.lightTransmittance(cloudPt, sunDir);
         float[] mt = Atmosphere.lightTransmittance(cloudPt, moonDir);
+        float[] eye = {0, Atmosphere.RG + camAltKm + 0.064f, 0};
+        float[] stEye = Atmosphere.lightTransmittance(eye, sunDir);
+        float[] mtEye = Atmosphere.lightTransmittance(eye, moonDir);
         for (int k = 0; k < 3; k++) {
             sunColor[k] = st[k] * SUN_I;
             moonColor[k] = mt[k] * moonI;
+            sunTrans[k] = stEye[k];
+            moonTrans[k] = mtEye[k];
         }
 
         // Auto exposure, smoothed over time.

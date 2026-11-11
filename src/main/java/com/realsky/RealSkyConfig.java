@@ -13,6 +13,8 @@ import java.nio.file.Path;
 public class RealSkyConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+    /** Settings layout version; older files get their cloud settings upgraded to the new defaults. */
+    public int configVersion = 2;
     public boolean enabled = true;
 
     /** Observer latitude in degrees. Tilts the sun's path and the star field; 0 = sun passes straight overhead. */
@@ -25,10 +27,14 @@ public class RealSkyConfig {
     public float sunRadiusDeg = 0.45f;
     public float moonRadiusDeg = 0.5f;
 
-    /** Volumetric clouds. coverage 0..1, quality = ray-march steps (24 = fast, 48 = default, 96 = ultra). */
+    /** Volumetric clouds. coverage 0..1, quality = ray-march steps (24 = fast, 40 = default, 80 = ultra). */
     public boolean clouds = true;
-    public float cloudCoverage = 0.35f;
-    public int cloudQuality = 48;
+    public float cloudCoverage = 0.5f;
+    public int cloudQuality = 40;
+    /** Resolution of the cloud pass relative to the screen (0.25 = fastest, 0.5 = default, 1.0 = sharpest). */
+    public float cloudResolution = 0.5f;
+    /** Thin, high cirrus streaks (0 = off). */
+    public float cirrus = 0.4f;
     public float cloudWindSpeed = 1.0f;
     /** Hide vanilla blocky clouds while this mod's sky is active. */
     public boolean hideVanillaClouds = true;
@@ -54,13 +60,21 @@ public class RealSkyConfig {
         RealSkyConfig cfg = null;
         if (Files.exists(p)) {
             try (Reader r = Files.newBufferedReader(p)) {
-                cfg = GSON.fromJson(r, RealSkyConfig.class);
+                com.google.gson.JsonObject json = com.google.gson.JsonParser.parseReader(r).getAsJsonObject();
+                cfg = GSON.fromJson(json, RealSkyConfig.class);
+                if (!json.has("configVersion")) {
+                    RealSkyConfig d = new RealSkyConfig();
+                    cfg.cloudCoverage = d.cloudCoverage;
+                    cfg.cloudQuality = d.cloudQuality;
+                    cfg.configVersion = d.configVersion;
+                }
             } catch (Exception e) {
                 RealSky.LOGGER.error("Could not read {}, using defaults", p, e);
             }
         }
         if (cfg == null) cfg = new RealSkyConfig();
-        cfg.cloudQuality = Math.max(8, Math.min(192, cfg.cloudQuality));
+        cfg.cloudQuality = Math.max(8, Math.min(128, cfg.cloudQuality));
+        cfg.cloudResolution = Math.max(0.2f, Math.min(1f, cfg.cloudResolution));
         cfg.cloudCoverage = Math.max(0f, Math.min(1f, cfg.cloudCoverage));
         cfg.save();
         return cfg;
